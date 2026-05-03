@@ -3,21 +3,29 @@ const qrcode = require('qrcode-terminal');
 const fetch = require('node-fetch');
 const express = require('express');
 
-// Read secrets from environment variables (Render will set them)
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
 const ADMIN_NUMBER = process.env.ADMIN_NUMBER;
 const PORT = process.env.PORT || 3000;
 
-// Express server to keep alive
 const app = express();
 app.get('/health', (req, res) => res.send('OK'));
 app.listen(PORT, () => console.log(`Keep-alive server running on port ${PORT}`));
 
-// WhatsApp client
+// --- Puppeteer configuration for Render (full puppeteer with bundled Chrome) ---
+const puppeteerOptions = {
+    headless: true,
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+    ]
+};
+
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+    puppeteer: puppeteerOptions    // <-- pass the options here
 });
 
 client.on('qr', qr => {
