@@ -16,10 +16,12 @@ let qrDataUrl = null;
 let clientStatus = 'disconnected';
 let lastConnectedTime = null;
 let qrGenerated = false;
+let client = null;             // holds the active WhatsApp client instance
 
-// ========== ROUTES ==========
+// ========== Express routes ==========
 app.get('/health', (req, res) => res.send('OK'));
 
+// QR page – auto‑refreshes every 15 seconds
 app.get('/qr', (req, res) => {
   if (!qrDataUrl) {
     res.send('<h2>QR code not ready yet. Wait a moment and refresh.</h2>');
@@ -27,7 +29,7 @@ app.get('/qr', (req, res) => {
   }
   res.send(`
     <html><head><title>WhatsApp QR Code</title>
-    <meta http-equiv="refresh" content="15" />
+      <meta http-equiv="refresh" content="15" />
     </head>
     <body style="text-align:center; background:#111; color:white; font-family:sans-serif;">
       <h1>Scan this with WhatsApp</h1>
@@ -37,6 +39,7 @@ app.get('/qr', (req, res) => {
   `);
 });
 
+// Status endpoint for dashboard
 app.get('/status', (req, res) => {
   res.json({
     status: clientStatus,
@@ -46,6 +49,7 @@ app.get('/status', (req, res) => {
   });
 });
 
+// Dashboard HTML – auto‑refreshes every 30 seconds
 app.get('/dashboard', async (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).send('Forbidden');
   try {
@@ -59,6 +63,7 @@ app.get('/dashboard', async (req, res) => {
   }
 });
 
+// Payout trigger (unchanged)
 app.post('/triggerPayout', async (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).json({error:'Forbidden'});
   const { race, first, second, third } = req.body;
@@ -72,6 +77,26 @@ app.post('/triggerPayout', async (req, res) => {
   }
 });
 
+// 🆕 Logout – destroy session and restart client
+app.post('/logout', async (req, res) => {
+  if (req.query.token !== BRIDGE_TOKEN) return res.status(403).json({error:'Forbidden'});
+  try {
+    if (client) {
+      await client.destroy();
+      client = null;
+      console.log('👋 Session destroyed by admin.');
+    }
+    // restart client after short delay
+    setTimeout(() => {
+      startClient().catch(err => console.error('Restart failed:', err));
+    }, 3000);
+    res.json({result: 'Logged out, restarting...'});
+  } catch (err) {
+    res.json({error: err.message});
+  }
+});
+
+// ========== Dashboard HTML generator ==========
 function generateDashboardHTML(data, botStatus) {
   const { raceName, status, runnerCount, playFee, userBalances, recentBets } = data;
   const balanceRows = userBalances.map(u => `<tr><td>${u.number}</td><td>${u.deposits}</td><td>${u.withdraws}</td><td>${u.totalBets}</td><td><strong>${u.balance}</strong></td></tr>`).join('');
@@ -80,10 +105,13 @@ function generateDashboardHTML(data, botStatus) {
   const qrAlert = botStatus.qrReady;
   const lastConn = botStatus.lastConnected ? new Date(botStatus.lastConnected).toLocaleString() : 'Never';
   const expires = botStatus.estimatedExpiry ? new Date(botStatus.estimatedExpiry).toLocaleString() : 'Unknown';
+
   return `
 <!DOCTYPE html>
 <html><head><title>Betting Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Auto‑refresh every 30 seconds -->
+<meta http-equiv="refresh" content="30" />
 <style>
   body { font-family: Arial; background: #f4f4f4; margin: 20px; }
   .card { background: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
@@ -93,27 +121,38 @@ function generateDashboardHTML(data, botStatus) {
   .bot-online { color: green; font-weight: bold; }
   .bot-offline { color: red; font-weight: bold; }
   .qr-alert { background: #ffcccc; padding: 10px; border-radius: 5px; }
-  button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; }
-  input { padding: 8px; margin: 5px; }
+  button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
+  .logout-btn { background: #dc3545; }
+  input, select { padding: 8px; margin: 5px; }
 </style></head>
 <body>
   <h1>🏇 Race Dashboard</h1>
+  
   <div class="card">
     <h3>🤖 Bot Status</h3>
     <p>Status: <span class="${botOnline ? 'bot-online' : 'bot-offline'}">${botOnline ? '🟢 ONLINE' : '🔴 OFFLINE'}</span></p>
     <p>Last Connected: ${lastConn}</p>
     <p>Session Expires (est.): ${expires}</p>
-    ${qrAlert ? '<div class="qr-alert"><strong>⚠️ QR code waiting to be scanned!</strong> <a href="/qr">Open QR page</a></div>' : ''}
+    ${qrAlert ? '<div class="qr-alert"><strong>⚠️ QR code waiting to be scanned!</strong> <a href="/qr" target="_blank">Open QR page (new tab)</a></div>' : ''}
+    <div style="margin-top:10px;">
+      <button onclick="window.open('/qr','_blank')">📷 Show QR (new tab)</button>
+      <button class="logout-btn" onclick="logoutBot()">🚪 Logout & Reconnect</button>
+    </div>
   </div>
+
   <div class="card">
     <p><strong>Race:</strong> ${raceName} 
-       <span class="${status==='ACTIVE'?'status-active':'status-closed'}">(${status})</span></p>
+       <span class="${status==='ACTIVE'?'status-active':'status-closed'}">(${status})</span>
+    </p>
     <p>Runners: ${runnerCount} | Play Fee: ${playFee}%</p>
   </div>
+
   <div class="card"><h3>💼 User Balances</h3><table>${balanceRows}</table></div>
   <div class="card"><h3>📋 Recent Bets</h3><table>${betRows}</table></div>
+
   <div class="card">
-    <h3>🏆 Payout</h3>
+    <h3>🏆 Payout Control</h3>
+    <p>Set status to CLOSED on sheet first!</p>
     <label>Race: <input type="text" id="prace" value="${raceName}"></label>
     <label>1st: <input type="number" id="pfirst"></label>
     <label>2nd: <input type="number" id="psecond"></label>
@@ -121,6 +160,7 @@ function generateDashboardHTML(data, botStatus) {
     <button onclick="triggerPayout()">Run Payout</button>
     <p id="payoutResult"></p>
   </div>
+
   <script>
     const token = '${BRIDGE_TOKEN}';
     async function triggerPayout() {
@@ -136,54 +176,84 @@ function generateDashboardHTML(data, botStatus) {
       const data = await res.json();
       document.getElementById('payoutResult').innerText = data.reply || 'Done';
     }
+    async function logoutBot() {
+      if (!confirm('Logout the bot? A new QR will be generated.')) return;
+      const res = await fetch('/logout?token=' + token, {method: 'POST'});
+      const data = await res.json();
+      alert(data.result || data.error);
+      setTimeout(() => location.reload(), 5000);
+    }
   </script>
 </body></html>`;
 }
 
-// ========== START WHATSAPP CLIENT ==========
+// ========== WhatsApp client with maximum stability ==========
 async function startClient() {
   const execPath = await chromium.executablePath();
-  console.log('Chromium path:', execPath);
+  console.log('Chromium executable:', execPath);
 
-  const client = new Client({
+  // Aggressive flags to keep memory usage low on 512 MB Render
+  const puppeteerOpts = {
+    executablePath: execPath,
+    headless: 'new',                     // modern headless mode
+    args: [
+      ...chromium.args,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--single-process',               // reduces memory
+      '--no-zygote',
+      '--max-old-space-size=256',       // cap JS heap
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-features=Translate,BackForwardCache',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-first-run',
+      '--safebrowsing-disable-auto-update',
+    ],
+    protocolTimeout: 240000,            // 4 minutes per protocol call
+  };
+
+  client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: {
-      executablePath: execPath,
-      headless: true,
-      args: [
-        ...chromium.args,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
-      ],
-      // 🔧 STABILITY FIX: increase timeouts for low‑memory servers
-      protocolTimeout: 120000,          // 2 minutes per protocol call
-    }
+    puppeteer: puppeteerOpts
   });
 
   client.on('qr', async (qrText) => {
     qrGenerated = true;
     clientStatus = 'disconnected';
-    try {
-      qrDataUrl = await qrcode.toDataURL(qrText, { scale: 8 });
-      console.log('📱 QR ready. Scan now: /qr');
-    } catch (err) {
-      console.error('QR image error:', err);
-    }
+    qrDataUrl = await qrcode.toDataURL(qrText, { scale: 8 });
+    console.log('📱 QR ready. Scan now: /qr');
     await sendStatusUpdate('disconnected').catch(() => {});
   });
 
-  client.on('ready', () => {
+  client.on('ready', async () => {
     qrGenerated = false;
     qrDataUrl = null;
     clientStatus = 'connected';
     lastConnectedTime = new Date();
     console.log('✅ WhatsApp bridge is connected.');
-    sendStatusUpdate('connected').catch(() => {});
+    await sendStatusUpdate('connected').catch(() => {});
+
+    // Send balance alert to admin on successful connect
+    try {
+      const balResp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=dashboard`);
+      const dash = await balResp.json();
+      const adminBalance = dash.userBalances.find(u => u.number === ADMIN_NUMBER);
+      if (adminBalance) {
+        const msg = `🤖 Bot online. Your balance: ₹${adminBalance.balance}`;
+        await client.sendMessage(ADMIN_NUMBER + '@c.us', msg);
+        console.log('📤 Admin balance alert sent.');
+      }
+    } catch (e) {
+      console.error('Could not send balance alert:', e);
+    }
   });
 
   client.on('message', async msg => {
-    // Ignore status broadcasts and empty messages
     if (msg.from === 'status@broadcast' || msg.isStatus || !msg.body) return;
 
     const isGroup = msg.from.endsWith('@g.us');
@@ -221,6 +291,19 @@ async function startClient() {
     }
   });
 
+  // 🆕 Auto‑reconnect on disconnect
+  client.on('disconnected', async (reason) => {
+    console.log('🔌 Disconnected:', reason);
+    clientStatus = 'disconnected';
+    await sendStatusUpdate('disconnected').catch(() => {});
+    // Wait 10 seconds, then restart
+    setTimeout(() => {
+      console.log('🔄 Attempting reconnect...');
+      startClient().catch(err => console.error('Reconnect failed:', err));
+    }, 10000);
+  });
+
+  console.log('🚀 Initializing WhatsApp client...');
   await client.initialize();
 }
 
@@ -234,7 +317,12 @@ async function sendStatusUpdate(status) {
   }
 }
 
+// Start the server and the client
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  startClient().catch(err => console.error('Failed to start:', err));
+  startClient().catch(err => {
+    console.error('Initial start failed:', err);
+    console.log('🔄 Restarting in 10 seconds...');
+    setTimeout(() => startClient(), 10000);
+  });
 });
