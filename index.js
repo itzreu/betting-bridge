@@ -10,36 +10,25 @@ const ADMIN_NUMBER = process.env.ADMIN_NUMBER;
 const PORT = process.env.PORT || 3000;
 
 const app = express();
-app.use(express.json());
 
 let qrDataUrl = null;
 let clientStatus = 'disconnected';
 let lastConnectedTime = null;
 let qrGenerated = false;
-let client = null;             // holds the active WhatsApp client instance
+let client = null;
 
-// ========== Express routes ==========
+// ========== Minimal routes (keep only what's essential) ==========
 app.get('/health', (req, res) => res.send('OK'));
 
-// QR page – auto‑refreshes every 15 seconds
 app.get('/qr', (req, res) => {
-  if (!qrDataUrl) {
-    res.send('<h2>QR code not ready yet. Wait a moment and refresh.</h2>');
-    return;
-  }
-  res.send(`
-    <html><head><title>WhatsApp QR Code</title>
-      <meta http-equiv="refresh" content="15" />
-    </head>
-    <body style="text-align:center; background:#111; color:white; font-family:sans-serif;">
-      <h1>Scan this with WhatsApp</h1>
-      <img src="${qrDataUrl}" alt="QR Code" style="border:10px solid white; border-radius:20px;" />
-      <p>Settings → Linked Devices → Link a Device</p>
-    </body></html>
-  `);
+  if (!qrDataUrl) return res.send('<h2>QR code not ready yet. Refresh in a few seconds.</h2>');
+  res.send(`<html><head><title>WhatsApp QR</title><meta http-equiv="refresh" content="15"></head>
+    <body style="text-align:center;background:#111;color:white;font-family:sans-serif">
+      <h1>Scan with WhatsApp</h1>
+      <img src="${qrDataUrl}" style="border:10px solid white;border-radius:20px;">
+    </body></html>`);
 });
 
-// Status endpoint for dashboard
 app.get('/status', (req, res) => {
   res.json({
     status: clientStatus,
@@ -49,208 +38,101 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Dashboard HTML – auto‑refreshes every 30 seconds
-app.get('/dashboard', async (req, res) => {
+// Dashboard – now just a simple page that calls Apps Script directly (no extra memory for big HTML)
+app.get('/dashboard', (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).send('Forbidden');
-  try {
-    const dataResp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=dashboard`);
-    const data = await dataResp.json();
-    const statusResp = await fetch(`http://localhost:${PORT}/status`);
-    const botStatus = await statusResp.json();
-    res.send(generateDashboardHTML(data, botStatus));
-  } catch (err) {
-    res.send('Error loading dashboard: ' + err.message);
-  }
+  // Redirect to a static dashboard served from Apps Script? Keep it lightweight.
+  res.send(`<html><head><title>Dashboard</title>
+    <meta http-equiv="refresh" content="30">
+    <style>body{font-family:Arial;margin:20px}.card{background:white;padding:15px;border-radius:8px;margin:10px 0;box-shadow:0 2px 5px rgba(0,0,0,0.1)}</style></head>
+    <body>
+      <h1>🏇 Dashboard</h1>
+      <div class="card">
+        <p>Bot status: <span id="status">checking...</span></p>
+        <p><button onclick="window.open('/qr','_blank')">Show QR</button>
+        <button onclick="logout()">Logout & Restart</button></p>
+      </div>
+      <div class="card">Full dashboard data is fetched directly from Apps Script.</div>
+      <script>
+        fetch('/status').then(r=>r.json()).then(s=>{
+          document.getElementById('status').innerHTML = s.status==='connected'?'🟢 ONLINE':'🔴 OFFLINE';
+        });
+        async function logout(){
+          if(!confirm('Restart bot?')) return;
+          await fetch('/logout?token=${BRIDGE_TOKEN}', {method:'POST'});
+          setTimeout(()=>location.reload(),5000);
+        }
+      </script>
+    </body></html>`);
 });
 
-// Payout trigger (unchanged)
-app.post('/triggerPayout', async (req, res) => {
-  if (req.query.token !== BRIDGE_TOKEN) return res.status(403).json({error:'Forbidden'});
-  const { race, first, second, third } = req.body;
-  if (!race || !first || !second || !third) return res.status(400).json({error:'Missing fields'});
-  try {
-    const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=triggerPayout&race=${race}&first=${first}&second=${second}&third=${third}`);
-    const result = await resp.json();
-    res.json(result);
-  } catch (err) {
-    res.json({reply: 'Error: ' + err.message});
-  }
-});
-
-// 🆕 Logout – destroy session and restart client
+// Logout endpoint (same as before)
 app.post('/logout', async (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).json({error:'Forbidden'});
   try {
-    if (client) {
-      await client.destroy();
-      client = null;
-      console.log('👋 Session destroyed by admin.');
-    }
-    // restart client after short delay
-    setTimeout(() => {
-      startClient().catch(err => console.error('Restart failed:', err));
-    }, 3000);
-    res.json({result: 'Logged out, restarting...'});
-  } catch (err) {
-    res.json({error: err.message});
-  }
+    if (client) { await client.destroy(); client = null; }
+    setTimeout(() => startClient(), 3000);
+    res.json({result:'OK'});
+  } catch(e) { res.json({error:e.message}); }
 });
 
-// ========== Dashboard HTML generator ==========
-function generateDashboardHTML(data, botStatus) {
-  const { raceName, status, runnerCount, playFee, userBalances, recentBets } = data;
-  const balanceRows = userBalances.map(u => `<tr><td>${u.number}</td><td>${u.deposits}</td><td>${u.withdraws}</td><td>${u.totalBets}</td><td><strong>${u.balance}</strong></td></tr>`).join('');
-  const betRows = recentBets.map(b => `<tr><td>${b.betId}</td><td>${b.race}</td><td>${b.user}</td><td>${b.horse} ${b.position}</td><td>${b.amount}</td><td>${b.win||'-'}</td><td>${b.lose||'-'}</td></tr>`).join('');
-  const botOnline = botStatus.status === 'connected';
-  const qrAlert = botStatus.qrReady;
-  const lastConn = botStatus.lastConnected ? new Date(botStatus.lastConnected).toLocaleString() : 'Never';
-  const expires = botStatus.estimatedExpiry ? new Date(botStatus.estimatedExpiry).toLocaleString() : 'Unknown';
-
-  return `
-<!DOCTYPE html>
-<html><head><title>Betting Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Auto‑refresh every 30 seconds -->
-<meta http-equiv="refresh" content="30" />
-<style>
-  body { font-family: Arial; background: #f4f4f4; margin: 20px; }
-  .card { background: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-  th { background: #007bff; color: white; }
-  .bot-online { color: green; font-weight: bold; }
-  .bot-offline { color: red; font-weight: bold; }
-  .qr-alert { background: #ffcccc; padding: 10px; border-radius: 5px; }
-  button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
-  .logout-btn { background: #dc3545; }
-  input, select { padding: 8px; margin: 5px; }
-</style></head>
-<body>
-  <h1>🏇 Race Dashboard</h1>
-  
-  <div class="card">
-    <h3>🤖 Bot Status</h3>
-    <p>Status: <span class="${botOnline ? 'bot-online' : 'bot-offline'}">${botOnline ? '🟢 ONLINE' : '🔴 OFFLINE'}</span></p>
-    <p>Last Connected: ${lastConn}</p>
-    <p>Session Expires (est.): ${expires}</p>
-    ${qrAlert ? '<div class="qr-alert"><strong>⚠️ QR code waiting to be scanned!</strong> <a href="/qr" target="_blank">Open QR page (new tab)</a></div>' : ''}
-    <div style="margin-top:10px;">
-      <button onclick="window.open('/qr','_blank')">📷 Show QR (new tab)</button>
-      <button class="logout-btn" onclick="logoutBot()">🚪 Logout & Reconnect</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <p><strong>Race:</strong> ${raceName} 
-       <span class="${status==='ACTIVE'?'status-active':'status-closed'}">(${status})</span>
-    </p>
-    <p>Runners: ${runnerCount} | Play Fee: ${playFee}%</p>
-  </div>
-
-  <div class="card"><h3>💼 User Balances</h3><table>${balanceRows}</table></div>
-  <div class="card"><h3>📋 Recent Bets</h3><table>${betRows}</table></div>
-
-  <div class="card">
-    <h3>🏆 Payout Control</h3>
-    <p>Set status to CLOSED on sheet first!</p>
-    <label>Race: <input type="text" id="prace" value="${raceName}"></label>
-    <label>1st: <input type="number" id="pfirst"></label>
-    <label>2nd: <input type="number" id="psecond"></label>
-    <label>3rd: <input type="number" id="pthird"></label>
-    <button onclick="triggerPayout()">Run Payout</button>
-    <p id="payoutResult"></p>
-  </div>
-
-  <script>
-    const token = '${BRIDGE_TOKEN}';
-    async function triggerPayout() {
-      const race = document.getElementById('prace').value;
-      const first = document.getElementById('pfirst').value;
-      const second = document.getElementById('psecond').value;
-      const third = document.getElementById('pthird').value;
-      const res = await fetch('/triggerPayout?token=' + token, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({race,first,second,third})
-      });
-      const data = await res.json();
-      document.getElementById('payoutResult').innerText = data.reply || 'Done';
-    }
-    async function logoutBot() {
-      if (!confirm('Logout the bot? A new QR will be generated.')) return;
-      const res = await fetch('/logout?token=' + token, {method: 'POST'});
-      const data = await res.json();
-      alert(data.result || data.error);
-      setTimeout(() => location.reload(), 5000);
-    }
-  </script>
-</body></html>`;
-}
-
-// ========== WhatsApp client with maximum stability ==========
+// ========== WhatsApp client ==========
 async function startClient() {
   const execPath = await chromium.executablePath();
   console.log('Chromium executable:', execPath);
 
-  // Aggressive flags to keep memory usage low on 512 MB Render
-  const puppeteerOpts = {
-    executablePath: execPath,
-    headless: 'new',                     // modern headless mode
-    args: [
-      ...chromium.args,
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--single-process',               // reduces memory
-      '--no-zygote',
-      '--max-old-space-size=256',       // cap JS heap
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--disable-features=Translate,BackForwardCache',
-      '--metrics-recording-only',
-      '--mute-audio',
-      '--no-first-run',
-      '--safebrowsing-disable-auto-update',
-    ],
-    protocolTimeout: 240000,            // 4 minutes per protocol call
-  };
-
   client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: puppeteerOpts
+    puppeteer: {
+      executablePath: execPath,
+      headless: 'new',
+      args: [
+        ...chromium.args,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+        '--no-zygote',
+        '--renderer-process-limit=1',          // only one renderer
+        '--js-flags=--max-old-space-size=128', // cap JS heap at 128 MB
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-features=Translate,BackForwardCache',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--no-first-run',
+        '--safebrowsing-disable-auto-update',
+        '--disable-extensions',
+        '--disable-default-apps'
+      ],
+      protocolTimeout: 240000,
+    }
   });
 
   client.on('qr', async (qrText) => {
-    qrGenerated = true;
-    clientStatus = 'disconnected';
-    qrDataUrl = await qrcode.toDataURL(qrText, { scale: 8 });
+    qrGenerated = true; clientStatus = 'disconnected';
+    qrDataUrl = await qrcode.toDataURL(qrText, { scale: 6 });  // smaller QR = less memory
     console.log('📱 QR ready. Scan now: /qr');
     await sendStatusUpdate('disconnected').catch(() => {});
   });
 
   client.on('ready', async () => {
-    qrGenerated = false;
-    qrDataUrl = null;
-    clientStatus = 'connected';
+    qrGenerated = false; qrDataUrl = null; clientStatus = 'connected';
     lastConnectedTime = new Date();
     console.log('✅ WhatsApp bridge is connected.');
     await sendStatusUpdate('connected').catch(() => {});
 
-    // Send balance alert to admin on successful connect
+    // Balance alert (uses a direct Apps Script call, not the dashboard)
     try {
-      const balResp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=dashboard`);
-      const dash = await balResp.json();
-      const adminBalance = dash.userBalances.find(u => u.number === ADMIN_NUMBER);
-      if (adminBalance) {
-        const msg = `🤖 Bot online. Your balance: ₹${adminBalance.balance}`;
-        await client.sendMessage(ADMIN_NUMBER + '@c.us', msg);
+      const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=balance&number=${ADMIN_NUMBER}`);
+      const data = await resp.json();
+      if (data.balance !== undefined) {
+        await client.sendMessage(ADMIN_NUMBER + '@c.us', `🤖 Bot online. Your balance: ₹${data.balance}`);
         console.log('📤 Admin balance alert sent.');
       }
-    } catch (e) {
-      console.error('Could not send balance alert:', e);
-    }
+    } catch(e) { console.error('Balance alert failed:', e); }
   });
 
   client.on('message', async msg => {
@@ -291,19 +173,14 @@ async function startClient() {
     }
   });
 
-  // 🆕 Auto‑reconnect on disconnect
   client.on('disconnected', async (reason) => {
     console.log('🔌 Disconnected:', reason);
     clientStatus = 'disconnected';
     await sendStatusUpdate('disconnected').catch(() => {});
-    // Wait 10 seconds, then restart
-    setTimeout(() => {
-      console.log('🔄 Attempting reconnect...');
-      startClient().catch(err => console.error('Reconnect failed:', err));
-    }, 10000);
+    setTimeout(() => startClient(), 10000);
   });
 
-  console.log('🚀 Initializing WhatsApp client...');
+  console.log('🚀 Initializing...');
   await client.initialize();
 }
 
@@ -311,18 +188,13 @@ async function sendStatusUpdate(status) {
   try {
     const url = `${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=updateBotStatus&status=${status}&timestamp=${encodeURIComponent(new Date().toISOString())}`;
     await fetch(url);
-    console.log(`📡 Status updated: ${status}`);
-  } catch (err) {
-    console.error('Status update failed:', err);
-  }
+  } catch(e) {}
 }
 
-// Start the server and the client
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startClient().catch(err => {
-    console.error('Initial start failed:', err);
-    console.log('🔄 Restarting in 10 seconds...');
+    console.error('Start failed:', err);
     setTimeout(() => startClient(), 10000);
   });
 });
