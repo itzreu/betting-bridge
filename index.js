@@ -12,13 +12,15 @@ const PORT           = process.env.PORT || 3000;
 const app = express();
 app.use(express.json());
 
+// ---- state ----
 let qrDataUrl        = null;
 let clientStatus     = 'disconnected';
 let lastConnectedTime = null;
 let qrGenerated      = false;
 let client           = null;
+let knownNumbers     = new Set();   // <-- stored phone numbers from sheet
 
-// ---- Routes ----
+// ========== Express Routes ==========
 app.get('/health', (_, res) => res.send('OK'));
 
 app.get('/qr', (req, res) => {
@@ -83,6 +85,7 @@ app.post('/logout', async (req, res) => {
   } catch (err) { res.json({ error: err.message }); }
 });
 
+// ========== Dashboard HTML Generator ==========
 function generateDashboardHTML(data, botStatus) {
   const { raceName, status, runnerCount, playFee, userBalances, recentBets } = data;
   const balanceRows = userBalances.map(u => `<tr><td>${u.number}</td><td>${u.deposits}</td><td>${u.withdraws}</td><td>${u.totalBets}</td><td><strong>${u.balance}</strong></td></tr>`).join('');
@@ -103,10 +106,24 @@ function generateDashboardHTML(data, botStatus) {
 <script>const token='${BRIDGE_TOKEN}';async function triggerPayout(){const race=document.getElementById('prace').value;const first=document.getElementById('pfirst').value;const second=document.getElementById('psecond').value;const third=document.getElementById('pthird').value;const res=await fetch('/triggerPayout?token='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({race,first,second,third})});const data=await res.json();document.getElementById('payoutResult').innerText=data.reply||'Done'}async function logoutBot(){if(!confirm('Logout and restart bot?'))return;await fetch('/logout?token='+token,{method:'POST'});setTimeout(()=>location.reload(),5000)}</script></body></html>`;
 }
 
-// ==================== WhatsApp Client ====================
+// ========== WhatsApp Client ==========
 async function startClient() {
   const execPath = await chromium.executablePath();
   console.log('Chromium executable:', execPath);
+
+  // Fetch known phone numbers from the sheet once
+  try {
+    const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=registeredNumbers`);
+    const data = await resp.json();
+    if (data.numbers) {
+      knownNumbers = new Set(data.numbers);
+      knownNumbers.add(ADMIN_NUMBER);   // make sure admin is there
+      console.log('📋 Registered numbers loaded:', [...knownNumbers].join(', '));
+    }
+  } catch (e) {
+    console.error('Failed to load registered numbers:', e);
+    knownNumbers.add(ADMIN_NUMBER);   // fallback at least admin
+  }
 
   client = new Client({
     authStrategy: new LocalAuth(),
@@ -139,7 +156,7 @@ async function startClient() {
     lastConnectedTime = new Date();
     console.log('✅ WhatsApp bridge is connected.');
     sendStatusUpdate('connected').catch(() => {});
-    // NO automatic balance alert – admin will request it with BAL command.
+    // NO auto alert – admin will send BAL
   });
 
   // ========== MESSAGE HANDLER (LID‑safe) ==========
@@ -149,30 +166,31 @@ async function startClient() {
     const isGroup = msg.from.endsWith('@g.us');
     let rawId = isGroup ? (msg.author || msg.from) : msg.from;
 
-    // 1. Try to get a real phone number via WhatsApp contact
-    let fromNumber = null;
+    // 1. Get the contact number (might be a LID string)
+    let contactNumber = null;
     try {
       const contact = await msg.getContact();
-      fromNumber = contact.number;
+      contactNumber = contact.number;
     } catch (e) {
-      // If it fails, we'll handle below
+      // ignore
     }
 
-    // 2. If not a valid phone (e.g., LID), resolve via sheet
-    const phonePattern = /^[1-9]\d{7,14}$/;
-    if (!fromNumber || !phonePattern.test(fromNumber)) {
+    let fromNumber = contactNumber;   // could be LID if not in known list
+
+    // 2. If the contact number is not a known phone number, treat it as potential LID
+    if (!fromNumber || !knownNumbers.has(fromNumber)) {
       const lid = rawId.replace('@c.us', '').replace('@lid', '').replace('@g.us', '');
-      console.log('⚠️ LID detected:', lid);
+      console.log('⚠️ Unknown number, resolving LID:', lid);
       try {
         const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=resolveLid&lid=${lid}`);
         const data = await resp.json();
         if (data.number) {
           fromNumber = data.number;
+          knownNumbers.add(fromNumber);   // remember for future
           console.log('✅ Resolved LID to phone:', fromNumber);
         } else {
-          // LID not linked – warn user
-          await msg.reply('❌ Your WhatsApp ID is not linked to a phone number. Contact admin to link your account.');
-          return;   // stop processing
+          await msg.reply('❌ Your WhatsApp ID is not linked. Contact admin to link your account.');
+          return;
         }
       } catch (err) {
         console.error('Error resolving LID:', err);
@@ -180,6 +198,7 @@ async function startClient() {
       }
     }
 
+    // 3. Now fromNumber is a real phone number
     console.log('📩 Message from', fromNumber, ':', msg.body);
 
     const payload = {
