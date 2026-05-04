@@ -18,7 +18,7 @@ let lastConnectedTime = null;
 let qrGenerated      = false;
 let client           = null;
 
-// ---- routes ----
+// ---- Routes ----
 app.get('/health', (_, res) => res.send('OK'));
 
 app.get('/qr', (req, res) => {
@@ -103,52 +103,62 @@ function generateDashboardHTML(data, botStatus) {
 <script>const token='${BRIDGE_TOKEN}';async function triggerPayout(){const race=document.getElementById('prace').value;const first=document.getElementById('pfirst').value;const second=document.getElementById('psecond').value;const third=document.getElementById('pthird').value;const res=await fetch('/triggerPayout?token='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({race,first,second,third})});const data=await res.json();document.getElementById('payoutResult').innerText=data.reply||'Done'}async function logoutBot(){if(!confirm('Logout and restart bot?'))return;await fetch('/logout?token='+token,{method:'POST'});setTimeout(()=>location.reload(),5000)}</script></body></html>`;
 }
 
-// WhatsApp Client with LID handling
+// ==================== WhatsApp Client ====================
 async function startClient() {
   const execPath = await chromium.executablePath();
   console.log('Chromium executable:', execPath);
+
   client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-      executablePath: execPath, headless: 'new',
-      args: [...chromium.args, '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote','--renderer-process-limit=1','--js-flags=--max-old-space-size=128','--disable-background-timer-throttling','--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','--disable-features=Translate,BackForwardCache','--metrics-recording-only','--mute-audio','--no-first-run','--safebrowsing-disable-auto-update','--disable-extensions','--disable-default-apps'],
+      executablePath: execPath,
+      headless: 'new',
+      args: [
+        ...chromium.args,
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu',
+        '--single-process','--no-zygote','--renderer-process-limit=1',
+        '--js-flags=--max-old-space-size=128',
+        '--disable-background-timer-throttling','--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding','--disable-features=Translate,BackForwardCache',
+        '--metrics-recording-only','--mute-audio','--no-first-run',
+        '--safebrowsing-disable-auto-update','--disable-extensions','--disable-default-apps'
+      ],
       protocolTimeout: 240000,
     }
   });
+
   client.on('qr', async (qrText) => {
     qrGenerated = true; clientStatus = 'disconnected';
     qrDataUrl = await qrcode.toDataURL(qrText, { scale: 6 });
     console.log('📱 QR ready. Scan now: /qr');
-    await sendStatusUpdate('disconnected').catch(()=>{});
+    await sendStatusUpdate('disconnected').catch(() => {});
   });
-  client.on('ready', async () => {
+
+  client.on('ready', () => {
     qrGenerated = false; qrDataUrl = null; clientStatus = 'connected';
     lastConnectedTime = new Date();
     console.log('✅ WhatsApp bridge is connected.');
-    await sendStatusUpdate('connected').catch(()=>{});
-    setTimeout(async () => {
-      try {
-        const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=balance&number=${ADMIN_NUMBER}`);
-        const data = await resp.json();
-        if (data.balance !== undefined) {
-          await client.sendMessage(`${ADMIN_NUMBER}@c.us`, `🤖 Bot online. Your balance: ₹${data.balance}`);
-          console.log('📤 Admin balance alert sent.');
-        }
-      } catch(e) { console.error('Balance alert failed:', e); }
-    }, 2000);
+    sendStatusUpdate('connected').catch(() => {});
+    // NO automatic balance alert – admin will request it with BAL command.
   });
 
+  // ========== MESSAGE HANDLER (LID‑safe) ==========
   client.on('message', async msg => {
     if (msg.from === 'status@broadcast' || msg.isStatus || !msg.body) return;
+
     const isGroup = msg.from.endsWith('@g.us');
     let rawId = isGroup ? (msg.author || msg.from) : msg.from;
 
+    // 1. Try to get a real phone number via WhatsApp contact
     let fromNumber = null;
     try {
       const contact = await msg.getContact();
       fromNumber = contact.number;
-    } catch (e) {}
+    } catch (e) {
+      // If it fails, we'll handle below
+    }
 
+    // 2. If not a valid phone (e.g., LID), resolve via sheet
     const phonePattern = /^[1-9]\d{7,14}$/;
     if (!fromNumber || !phonePattern.test(fromNumber)) {
       const lid = rawId.replace('@c.us', '').replace('@lid', '').replace('@g.us', '');
@@ -160,26 +170,46 @@ async function startClient() {
           fromNumber = data.number;
           console.log('✅ Resolved LID to phone:', fromNumber);
         } else {
+          // LID not linked – warn user
           await msg.reply('❌ Your WhatsApp ID is not linked to a phone number. Contact admin to link your account.');
-          return;
+          return;   // stop processing
         }
-      } catch (err) { console.error('Error resolving LID:', err); return; }
+      } catch (err) {
+        console.error('Error resolving LID:', err);
+        return;
+      }
     }
 
     console.log('📩 Message from', fromNumber, ':', msg.body);
-    const payload = { token: BRIDGE_TOKEN, from: fromNumber, message: msg.body, isGroup };
+
+    const payload = {
+      token: BRIDGE_TOKEN,
+      from: fromNumber,
+      message: msg.body,
+      isGroup
+    };
+
     try {
-      const response = await fetch(APPS_SCRIPT_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const response = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
       const data = await response.json();
       console.log('📨 Apps Script reply:', data.reply || '(no reply)');
-      if (data.reply) { await msg.reply(data.reply); console.log('✅ Reply sent.'); }
-    } catch (err) { console.error('❌ Error forwarding message:', err); }
+      if (data.reply) {
+        await msg.reply(data.reply);
+        console.log('✅ Reply sent.');
+      }
+    } catch (err) {
+      console.error('❌ Error forwarding message:', err);
+    }
   });
 
   client.on('disconnected', async (reason) => {
     console.log('🔌 Disconnected:', reason);
     clientStatus = 'disconnected';
-    await sendStatusUpdate('disconnected').catch(()=>{});
+    await sendStatusUpdate('disconnected').catch(() => {});
     setTimeout(() => startClient(), 10000);
   });
 
@@ -188,7 +218,15 @@ async function startClient() {
 }
 
 async function sendStatusUpdate(status) {
-  try { await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=updateBotStatus&status=${status}&timestamp=${encodeURIComponent(new Date().toISOString())}`); } catch(e) {}
+  try {
+    await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=updateBotStatus&status=${status}&timestamp=${encodeURIComponent(new Date().toISOString())}`);
+  } catch (e) {}
 }
 
-app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); startClient().catch(err => { console.error('Start failed:', err); setTimeout(() => startClient(), 10000); }); });
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  startClient().catch(err => {
+    console.error('Start failed:', err);
+    setTimeout(() => startClient(), 10000);
+  });
+});
