@@ -118,34 +118,47 @@ async function startClient() {
   });
 
 client.on('message', async msg => {
+    // Ignore system messages and empty body
     if (msg.from === 'status@broadcast' || msg.isStatus || !msg.body) return;
-    
+
+    // ------ 1. Get the REAL phone number (works with @c.us AND @lid) ------
+    let fromNumber = null;
     try {
-        // 👇 100% reliable way to get the real phone number, even from LID
-        const contact = await msg.getContact();
-        const fromNumber = contact.number;              // e.g. "918451943503"
-    } catch (err) {
-        console.error('❌ Could not get contact from message:', err);
-        // Fallback: try to extract digits (will still fail for LID, but logs show why)
-        const rawId = msg.from.endsWith('@g.us') ? msg.author : msg.from;
-        const digits = rawId.replace(/\D/g, '');
-        if (!digits) return;
-        // This fallback won't fix the issue, but prevents a crash
-        console.log('⚠️ Using fallback digits:', digits);
-        const payload = { token: BRIDGE_TOKEN, from: digits, message: msg.body, isGroup: msg.from.endsWith('@g.us') };
-        // process payload...
-        return;
+        const contact = await msg.getContact();   // ← built-in, always returns a valid contact
+        fromNumber = contact.number;              // e.g. "918451943503"
+    } catch (e) {
+        console.error('⚠️ Could not get contact from message. Skipping message.');
+        return;   // Don't process messages we can't identify
     }
-    
+
+    // ------ 2. Now we know who sent it – log and forward ------
     const isGroup = msg.from.endsWith('@g.us');
     console.log('📩 Message from', fromNumber, ':', msg.body);
-    
+
     const payload = {
         token: BRIDGE_TOKEN,
         from: fromNumber,
         message: msg.body,
         isGroup: isGroup
     };
+
+    try {
+        const response = await fetch(APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        console.log('📨 Apps Script reply:', data.reply || '(no reply)');
+        if (data.reply) {
+            await msg.reply(data.reply);
+            console.log('✅ Reply sent.');
+        }
+    } catch (err) {
+        console.error('❌ Error forwarding message:', err);
+    }
+});
+  
     
     try {
         const response = await fetch(APPS_SCRIPT_URL, {
