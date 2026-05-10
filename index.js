@@ -5,9 +5,9 @@ const express = require('express');
 const chromium = require('@sparticuz/chromium');
 
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-const BRIDGE_TOKEN    = process.env.BRIDGE_TOKEN;
-const ADMIN_NUMBER    = (process.env.ADMIN_NUMBER || '').trim();
-const PORT            = process.env.PORT || 3000;
+const BRIDGE_TOKEN   = process.env.BRIDGE_TOKEN;
+const ADMIN_NUMBER   = String(process.env.ADMIN_NUMBER || '').trim();
+const PORT           = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.json());
@@ -57,8 +57,7 @@ app.get('/qr-connected', (_, res) => res.send('<html><head><title>Connected ✅<
 
 app.get('/status', (_, res) => {
   res.json({
-    status: clientStatus,
-    qrReady: qrGenerated,
+    status: clientStatus, qrReady: qrGenerated,
     lastConnected: lastConnectedTime ? lastConnectedTime.toISOString() : null,
     estimatedExpiry: lastConnectedTime ? new Date(lastConnectedTime.getTime() + 7*24*60*60*1000).toISOString() : null
   });
@@ -95,7 +94,7 @@ app.post('/logout', async (req, res) => {
   } catch(e) { res.json({error:e.message}); }
 });
 
-// ========== Dashboard HTML ==========
+// ========== Dashboard HTML (WITH Add User + Register User) ==========
 function generateDashboardHTML(data, botStatus) {
   const { raceName, status, runnerCount, playFee, userBalances, recentBets, raceHistory } = data;
   const balanceRows = userBalances.map(u => `<tr><td>${u.number}</td><td>${u.deposits}</td><td>${u.withdraws}</td><td>${u.totalBets}</td><td><strong>${u.balance}</strong></td></tr>`).join('');
@@ -107,16 +106,25 @@ function generateDashboardHTML(data, botStatus) {
   const expires = botStatus.estimatedExpiry ? new Date(botStatus.estimatedExpiry).toLocaleString() : 'Unknown';
   return `<!DOCTYPE html><html><head><title>Betting Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30">
-<style>body{font-family:Arial;background:#f4f4f4;margin:20px}.card{background:white;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #ddd;padding:8px}th{background:#007bff;color:white}.bot-online{color:green;font-weight:bold}.bot-offline{color:red;font-weight:bold}.qr-alert{background:#ffcccc;padding:10px;border-radius:5px}button{padding:10px 20px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;margin:5px}.logout-btn{background:#dc3545}input{padding:8px;margin:5px}</style></head>
+<style>body{font-family:Arial;background:#f4f4f4;margin:20px}.card{background:white;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #ddd;padding:8px}th{background:#007bff;color:white}.bot-online{color:green;font-weight:bold}.bot-offline{color:red;font-weight:bold}.qr-alert{background:#ffcccc;padding:10px;border-radius:5px}button{padding:10px 20px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;margin:5px}.logout-btn{background:#dc3545}.add-btn{background:#007bff}input{padding:8px;margin:5px}</style></head>
 <body><h1>🏇 Race Dashboard</h1>
 <div class="card"><h3>📱 Session</h3><p>Status: <span class="${botOnline?'bot-online':'bot-offline'}">${botOnline?'🟢 ONLINE':'🔴 OFFLINE'}</span></p><p>Last Connected: ${lastConn}</p><p>Expires: ${expires}</p>${qrAlert?'<div class="qr-alert"><strong>⚠️ QR ready!</strong> <a href="/qr" target="_blank">Open QR page</a></div>':''}<div><button onclick="window.open('/start?token=${BRIDGE_TOKEN}','_blank')">🔄 Start Bot</button><button onclick="window.open('/qr','_blank')">📷 Show QR</button><button class="logout-btn" onclick="logoutBot()">🚪 Logout & Reconnect</button></div></div>
-<div class="card"><h3>📝 Add User</h3><input type="text" id="newNumber" placeholder="WhatsApp Number"><input type="text" id="newName" placeholder="Name"><input type="text" id="newLid" placeholder="LID (optional)"><button onclick="registerUser()">Register User</button><p id="regResult"></p></div>
+<div class="card"><h3>📝 Add / Register User</h3>
+<p style="font-size:12px;color:#666;">Use <b>Add User</b> to track messages only (no bot replies). Use <b>Register User</b> to activate full services (balance, replies).</p>
+<input type="text" id="newNumber" placeholder="WhatsApp Number"><input type="text" id="newName" placeholder="Name"><input type="text" id="newLid" placeholder="LID (optional)">
+<div><button class="add-btn" onclick="addUser()">➕ Add User (Track Only)</button><button onclick="registerUser()">✅ Register & Activate</button></div>
+<p id="regResult"></p></div>
 <div class="card"><p><strong>Race:</strong> ${raceName} <span class="${status==='ACTIVE'?'status-active':'status-closed'}">(${status})</span></p><p>Runners: ${runnerCount} | Play Fee: ${playFee}%</p></div>
 <div class="card"><h3>💼 User Balances</h3><table><tr><th>Number</th><th>Deposits</th><th>Withdrawals</th><th>Total Bets</th><th>Balance</th></tr>${balanceRows}</table></div>
 <div class="card"><h3>📋 Recent Bets</h3><table><tr><th>ID</th><th>Race</th><th>User</th><th>Horse</th><th>Amount</th><th>Win</th><th>Lose</th><th>Win?</th></tr>${betRows}</table></div>
 <div class="card"><h3>📜 Race History</h3><table><tr><th>Race</th><th>Date</th><th>Runners</th><th>Total Bets</th><th>Total Payout</th><th>Status</th></tr>${raceRows}</table></div>
 <div class="card"><h3>🏆 Payout Control</h3><label>Race: <input type="text" id="prace" value="${raceName}"></label><label>1st: <input type="number" id="pfirst"></label><label>2nd: <input type="number" id="psecond"></label><label>3rd: <input type="number" id="pthird"></label><button onclick="triggerPayout()">Run Payout</button><p id="payoutResult"></p></div>
-<script>const token='${BRIDGE_TOKEN}';async function triggerPayout(){const race=document.getElementById('prace').value;const first=document.getElementById('pfirst').value;const second=document.getElementById('psecond').value;const third=document.getElementById('pthird').value;const res=await fetch('/triggerPayout?token='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({race,first,second,third})});const data=await res.json();document.getElementById('payoutResult').innerText=data.reply||'Done'}async function logoutBot(){if(!confirm('Logout and restart bot?'))return;await fetch('/logout?token='+token,{method:'POST'});setTimeout(()=>location.reload(),5000)}async function registerUser(){const number=document.getElementById('newNumber').value;const name=document.getElementById('newName').value;const lid=document.getElementById('newLid').value;const res=await fetch('${APPS_SCRIPT_URL}?token='+token+'&action=registerUserWeb&number='+number+'&name='+encodeURIComponent(name)+'&lid='+lid);const data=await res.json();document.getElementById('regResult').innerText=data.reply||'Error'}</script></body></html>`;
+<script>const token='${BRIDGE_TOKEN}';const appsUrl='${APPS_SCRIPT_URL}';
+async function triggerPayout(){const race=document.getElementById('prace').value;const first=document.getElementById('pfirst').value;const second=document.getElementById('psecond').value;const third=document.getElementById('pthird').value;const res=await fetch('/triggerPayout?token='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({race,first,second,third})});const data=await res.json();document.getElementById('payoutResult').innerText=data.reply||'Done'}
+async function logoutBot(){if(!confirm('Logout and restart bot?'))return;await fetch('/logout?token='+token,{method:'POST'});setTimeout(()=>location.reload(),5000)}
+async function registerUser(){const number=document.getElementById('newNumber').value;const name=document.getElementById('newName').value;const lid=document.getElementById('newLid').value;const res=await fetch(appsUrl+'?token='+token+'&action=registerUserWeb&number='+number+'&name='+encodeURIComponent(name)+'&lid='+lid);const data=await res.json();document.getElementById('regResult').innerText=data.reply||'Error'}
+async function addUser(){const number=document.getElementById('newNumber').value;const name=document.getElementById('newName').value;const lid=document.getElementById('newLid').value;const res=await fetch(appsUrl+'?token='+token+'&action=addUserWeb&number='+number+'&name='+encodeURIComponent(name)+'&lid='+lid);const data=await res.json();document.getElementById('regResult').innerText=data.reply||'Error'}
+</script></body></html>`;
 }
 
 // ========== Memory Watchdog ==========
@@ -141,6 +149,7 @@ async function startClient() {
     if (data.numbers) {
       knownNumbers = new Set(data.numbers);
       knownNumbers.add(ADMIN_NUMBER);
+      console.log('📋 Registered numbers loaded:', [...knownNumbers].join(', '));
     }
   } catch(e) {}
 
@@ -172,7 +181,7 @@ async function startClient() {
     const isGroup = msg.from.endsWith('@g.us');
     const rawId = isGroup ? (msg.author || msg.from) : msg.from;
     const groupId = isGroup ? msg.from : '';
-    const isRaceMsg = /^\d{1,2}\s*(WIN|PLACE|W|P)\s*\d+$|^(BAL|REG|DEP|WITHDRAW|RESULT|BALSHEET|LINKLID|HIS|HISTORY)/i.test(msg.body);
+    const isRaceMsg = /^\d{1,2}\s*(WIN|PLACE|W|P)\s*\d+$|^(BAL|REG|DEP|WITHDRAW|RESULT|BALSHEET|LINKLID|HIS|HISTORY|ACTIVATE|DEACTIVATE)/i.test(msg.body);
 
     fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=logMessage&from=${rawId}&message=${encodeURIComponent(msg.body)}&isGroup=${isGroup}&groupId=${groupId}&isRaceMsg=${isRaceMsg}`).catch(()=>{});
 
@@ -182,7 +191,7 @@ async function startClient() {
       const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=resolveLid&lid=${lid}`);
       const data = await resp.json();
       if (data.number) {
-        fromNumber = data.number;
+        fromNumber = String(data.number);   // ✅ FORCE STRING
         knownNumbers.add(fromNumber);
       } else {
         console.error('LID resolution failed for', lid);
@@ -198,9 +207,12 @@ async function startClient() {
       const response = await fetch(APPS_SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
       const data = await response.json();
       console.log('📨 Reply:', data.reply || '(silent)');
-      if (isAdmin && data.reply && data.silent === false) {
+      // Reply if silent is false (admin always gets replies; activated users do too)
+      if (data.reply && data.silent === false) {
         await msg.reply(data.reply);
         console.log('✅ Reply sent.');
+      } else {
+        console.log('🤫 Silent – not replying.');
       }
     } catch(e) { console.error('❌ Error:', e); }
   });
@@ -212,6 +224,7 @@ async function startClient() {
     if (reason !== 'LOGOUT') setTimeout(() => startClient(), 10000);
   });
 
+  console.log('🚀 Initializing...');
   await client.initialize();
 }
 
