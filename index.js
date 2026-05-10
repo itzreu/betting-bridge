@@ -12,25 +12,52 @@ const PORT           = process.env.PORT || 3000;
 const app = express();
 app.use(express.json());
 
-// ---- state ----
 let qrDataUrl        = null;
 let clientStatus     = 'disconnected';
 let lastConnectedTime = null;
 let qrGenerated      = false;
 let client           = null;
-let knownNumbers     = new Set();   // <-- stored phone numbers from sheet
+let knownNumbers     = new Set();
+let lastQrTime       = 0;          // timestamp of last QR generation
+
+// ========== Helper ==========
+async function destroyClient() {
+  if (client) {
+    try { await client.destroy(); } catch (e) {}
+    client = null;
+  }
+}
 
 // ========== Express Routes ==========
+
 app.get('/health', (_, res) => res.send('OK'));
 
+// ----- Start the bot (admin only) -----
+app.get('/start', async (req, res) => {
+  if (req.query.token !== BRIDGE_TOKEN) return res.status(403).send('Forbidden');
+  if (clientStatus === 'connected') {
+    return res.send('<h2>✅ Bot already connected. No QR needed.</h2>');
+  }
+  // Limit QR generation to once every 4 hours (14400000 ms)
+  if (Date.now() - lastQrTime < 14400000) {
+    const minutesLeft = Math.ceil((14400000 - (Date.now() - lastQrTime)) / 60000);
+    return res.send(`<h2>⏳ QR already generated recently. Please wait ${minutesLeft} minutes.</h2>`);
+  }
+  lastQrTime = Date.now();
+  await destroyClient();
+  startClient().catch(err => console.error('Start failed:', err));
+  res.send(`<h2>🔄 Bot restarting… Open <a href="/qr">QR page</a> to scan.</h2>`);
+});
+
+// ----- QR page -----
 app.get('/qr', (req, res) => {
   if (clientStatus === 'connected') {
-    res.send(`<html><head><title>Already connected</title><meta http-equiv="refresh" content="3;url=/dashboard?token=${BRIDGE_TOKEN}"></head>
+    res.send(`<html><head><title>Connected</title><meta http-equiv="refresh" content="3;url=/dashboard?token=${BRIDGE_TOKEN}"></head>
     <body style="font-family:sans-serif;text-align:center;padding:50px;"><h1>✅ Already connected!</h1></body></html>`);
     return;
   }
   if (!qrDataUrl) {
-    res.send('<h2>QR code not ready. Refresh in a few seconds.</h2>');
+    res.send('<h2>QR not ready. Did you start the bot? Use /start first.</h2>');
     return;
   }
   res.send(`<html><head><title>WhatsApp QR</title><meta http-equiv="refresh" content="15">
@@ -54,6 +81,7 @@ app.get('/status', (_, res) => {
   });
 });
 
+// ----- Dashboard (full) -----
 app.get('/dashboard', async (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).send('Forbidden');
   try {
@@ -85,151 +113,156 @@ app.post('/logout', async (req, res) => {
   } catch (err) { res.json({ error: err.message }); }
 });
 
-// ========== Dashboard HTML Generator ==========
+// ========== Dashboard HTML Generator (with all panels) ==========
 function generateDashboardHTML(data, botStatus) {
-  const { raceName, status, runnerCount, playFee, userBalances, recentBets } = data;
+  const { raceName, status, runnerCount, playFee, userBalances, recentBets, raceHistory } = data;
   const balanceRows = userBalances.map(u => `<tr><td>${u.number}</td><td>${u.deposits}</td><td>${u.withdraws}</td><td>${u.totalBets}</td><td><strong>${u.balance}</strong></td></tr>`).join('');
-  const betRows = recentBets.map(b => `<tr><td>${b.betId}</td><td>${b.race}</td><td>${b.user}</td><td>${b.horse} ${b.position}</td><td>${b.amount}</td><td>${b.win||'-'}</td><td>${b.lose||'-'}</td></tr>`).join('');
+  const betRows = recentBets.map(b => `<tr><td>${b.betId}</td><td>${b.race}</td><td>${b.user}</td><td>${b.horse} ${b.position}</td><td>${b.amount}</td><td>${b.win||'-'}</td><td>${b.lose||'-'}</td><td>${b.isWin===true?'✅':b.isWin===false?'❌':''}</td></tr>`).join('');
+  const raceRows = raceHistory.map(r => `<tr><td>${r.raceName}</td><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.runners}</td><td>₹${r.totalBets}</td><td>₹${r.totalPayout}</td><td>${r.status}</td></tr>`).join('');
   const botOnline = botStatus.status === 'connected';
-  const qrAlert   = botStatus.qrReady;
-  const lastConn  = botStatus.lastConnected ? new Date(botStatus.lastConnected).toLocaleString() : 'Never';
-  const expires   = botStatus.estimatedExpiry ? new Date(botStatus.estimatedExpiry).toLocaleString() : 'Unknown';
-  return `<!DOCTYPE html><html><head><title>Betting Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30">
-<style>body{font-family:Arial;background:#f4f4f4;margin:20px}.card{background:white;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#007bff;color:white}.bot-online{color:green;font-weight:bold}.bot-offline{color:red;font-weight:bold}.qr-alert{background:#ffcccc;padding:10px;border-radius:5px}button{padding:10px 20px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;margin:5px}.logout-btn{background:#dc3545}input,select{padding:8px;margin:5px}</style></head>
-<body><h1>🏇 Race Dashboard</h1>
-<div class="card"><h3>📱 Session</h3><p>Status: <span class="${botOnline?'bot-online':'bot-offline'}">${botOnline?'🟢 ONLINE':'🔴 OFFLINE'}</span></p><p>Last Connected: ${lastConn}</p><p>Expires (est.): ${expires}</p>${qrAlert?'<div class="qr-alert"><strong>⚠️ QR ready!</strong> <a href="/qr" target="_blank">Open QR page</a></div>':''}<div><button onclick="window.open('/qr','_blank')">📷 Show QR</button><button class="logout-btn" onclick="logoutBot()">🚪 Logout & Reconnect</button>${botOnline?'<button onclick="window.open(\'/qr-connected\',\'_blank\')">✅ Show Connection</button>':''}</div></div>
-<div class="card"><p><strong>Race:</strong> ${raceName} <span class="${status==='ACTIVE'?'status-active':'status-closed'}">(${status})</span></p><p>Runners: ${runnerCount} | Play Fee: ${playFee}%</p></div>
-<div class="card"><h3>💼 User Balances</h3><table><tr><th>Number</th><th>Deposits</th><th>Withdrawals</th><th>Total Bets</th><th>Balance</th></tr>${balanceRows}</table></div>
-<div class="card"><h3>📋 Recent Bets</h3><table><tr><th>ID</th><th>Race</th><th>User</th><th>Horse</th><th>Amount</th><th>Win</th><th>Lose</th></tr>${betRows}</table></div>
-<div class="card"><h3>🏆 Payout Control</h3><label>Race: <input type="text" id="prace" value="${raceName}"></label><label>1st: <input type="number" id="pfirst"></label><label>2nd: <input type="number" id="psecond"></label><label>3rd: <input type="number" id="pthird"></label><button onclick="triggerPayout()">Run Payout</button><p id="payoutResult"></p></div>
-<script>const token='${BRIDGE_TOKEN}';async function triggerPayout(){const race=document.getElementById('prace').value;const first=document.getElementById('pfirst').value;const second=document.getElementById('psecond').value;const third=document.getElementById('pthird').value;const res=await fetch('/triggerPayout?token='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({race,first,second,third})});const data=await res.json();document.getElementById('payoutResult').innerText=data.reply||'Done'}async function logoutBot(){if(!confirm('Logout and restart bot?'))return;await fetch('/logout?token='+token,{method:'POST'});setTimeout(()=>location.reload(),5000)}</script></body></html>`;
+  const qrAlert = botStatus.qrReady;
+  const lastConn = botStatus.lastConnected ? new Date(botStatus.lastConnected).toLocaleString() : 'Never';
+  const expires = botStatus.estimatedExpiry ? new Date(botStatus.estimatedExpiry).toLocaleString() : 'Unknown';
+  return `<!DOCTYPE html><html><head><title>Betting Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30"><style>body{font-family:Arial;background:#f4f4f4;margin:20px}.card{background:white;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#007bff;color:white}.bot-online{color:green;font-weight:bold}.bot-offline{color:red;font-weight:bold}.qr-alert{background:#ffcccc;padding:10px;border-radius:5px}button{padding:10px 20px;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;margin:5px}.logout-btn{background:#dc3545}input,select{padding:8px;margin:5px}</style></head><body><h1>🏇 Race Dashboard</h1><div class="card"><h3>📱 Session</h3><p>Status: <span class="${botOnline?'bot-online':'bot-offline'}">${botOnline?'🟢 ONLINE':'🔴 OFFLINE'}</span></p><p>Last Connected: ${lastConn}</p><p>Expires: ${expires}</p>${qrAlert?'<div class="qr-alert"><strong>⚠️ QR ready!</strong> <a href="/qr" target="_blank">Open QR page</a></div>':''}<div><button onclick="window.open('/start?token=${BRIDGE_TOKEN}','_blank')">🔄 Start Bot</button><button onclick="window.open('/qr','_blank')">📷 Show QR</button><button class="logout-btn" onclick="logoutBot()">🚪 Logout & Reconnect</button>${botOnline?'<button onclick="window.open(\'/qr-connected\',\'_blank\')">✅ Show Connection</button>':''}</div></div><div class="card"><h3>📝 Add User</h3><input type="text" id="newNumber" placeholder="WhatsApp Number"><input type="text" id="newName" placeholder="Name"><input type="text" id="newLid" placeholder="LID (optional)"><button onclick="registerUser()">Register User</button><p id="regResult"></p></div><div class="card"><p><strong>Race:</strong> ${raceName} <span class="${status==='ACTIVE'?'status-active':'status-closed'}">(${status})</span></p><p>Runners: ${runnerCount} | Play Fee: ${playFee}%</p></div><div class="card"><h3>💼 User Balances</h3><table><tr><th>Number</th><th>Deposits</th><th>Withdrawals</th><th>Total Bets</th><th>Balance</th></tr>${balanceRows}</table></div><div class="card"><h3>📋 Recent Bets</h3><table><tr><th>ID</th><th>Race</th><th>User</th><th>Horse</th><th>Amount</th><th>Win</th><th>Lose</th><th>Win?</th></tr>${betRows}</table></div><div class="card"><h3>📜 Race History</h3><table><tr><th>Race</th><th>Date</th><th>Runners</th><th>Total Bets</th><th>Total Payout</th><th>Status</th></tr>${raceRows}</table></div><div class="card"><h3>🏆 Payout Control</h3><label>Race: <input type="text" id="prace" value="${raceName}"></label><label>1st: <input type="number" id="pfirst"></label><label>2nd: <input type="number" id="psecond"></label><label>3rd: <input type="number" id="pthird"></label><button onclick="triggerPayout()">Run Payout</button><p id="payoutResult"></p></div><script>const token='${BRIDGE_TOKEN}';async function triggerPayout(){const race=document.getElementById('prace').value;const first=document.getElementById('pfirst').value;const second=document.getElementById('psecond').value;const third=document.getElementById('pthird').value;const res=await fetch('/triggerPayout?token='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({race,first,second,third})});const data=await res.json();document.getElementById('payoutResult').innerText=data.reply||'Done'}async function logoutBot(){if(!confirm('Logout and restart bot?'))return;await fetch('/logout?token='+token,{method:'POST'});setTimeout(()=>location.reload(),5000)}async function registerUser(){const number=document.getElementById('newNumber').value;const name=document.getElementById('newName').value;const lid=document.getElementById('newLid').value;const res=await fetch('${APPS_SCRIPT_URL}?token='+token+'&action=registerUserWeb&number='+number+'&name='+encodeURIComponent(name)+'&lid='+lid);const data=await res.json();document.getElementById('regResult').innerText=data.reply||'Error'}</script></body></html>`;
 }
+
+// ========== Memory Watchdog ==========
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const rssMB = Math.round(mem.rss / 1024 / 1024);
+  console.log(`📊 Memory: ${rssMB} MB`);
+  if (rssMB > 250 && clientStatus === 'connected') {
+    console.warn(`⚠️ Memory high (${rssMB} MB). Restarting WhatsApp client…`);
+    destroyClient().then(() => {
+      setTimeout(() => {
+        startClient().catch(err => console.error('Restart failed:', err));
+      }, 5000);
+    });
+  }
+}, 30000);   // check every 30 seconds
 
 // ========== WhatsApp Client ==========
 async function startClient() {
   const execPath = await chromium.executablePath();
   console.log('Chromium executable:', execPath);
 
-  // Fetch known phone numbers from the sheet once
+  // Load registered numbers
   try {
     const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=registeredNumbers`);
     const data = await resp.json();
     if (data.numbers) {
       knownNumbers = new Set(data.numbers);
-      knownNumbers.add(ADMIN_NUMBER);   // make sure admin is there
+      knownNumbers.add(ADMIN_NUMBER);
       console.log('📋 Registered numbers loaded:', [...knownNumbers].join(', '));
     }
-  } catch (e) {
-    console.error('Failed to load registered numbers:', e);
-    knownNumbers.add(ADMIN_NUMBER);   // fallback at least admin
-  }
+  } catch (e) { console.error('Failed to load numbers:', e); }
 
   client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth({ clientId: 'betting-bot' }),
     puppeteer: {
       executablePath: execPath,
       headless: 'new',
       args: [
         ...chromium.args,
-        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu',
-        '--single-process','--no-zygote','--renderer-process-limit=1',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+        '--no-zygote',
+        '--renderer-process-limit=1',
         '--js-flags=--max-old-space-size=128',
-        '--disable-background-timer-throttling','--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding','--disable-features=Translate,BackForwardCache',
-        '--metrics-recording-only','--mute-audio','--no-first-run',
-        '--safebrowsing-disable-auto-update','--disable-extensions','--disable-default-apps'
+        '--memory-pressure-off',
+        '--disable-accelerated-2d-canvas',
+        '--disable-features=site-per-process,Translate,BackForwardCache',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--no-first-run',
+        '--safebrowsing-disable-auto-update',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-breakpad',
+        '--disable-hang-monitor'
       ],
       protocolTimeout: 240000,
     }
   });
 
   client.on('qr', async (qrText) => {
-    qrGenerated = true; clientStatus = 'disconnected';
+    qrGenerated = true;
+    clientStatus = 'disconnected';
     qrDataUrl = await qrcode.toDataURL(qrText, { scale: 6 });
     console.log('📱 QR ready. Scan now: /qr');
     await sendStatusUpdate('disconnected').catch(() => {});
   });
 
   client.on('ready', () => {
-    qrGenerated = false; qrDataUrl = null; clientStatus = 'connected';
+    qrGenerated = false;
+    qrDataUrl = null;
+    clientStatus = 'connected';
     lastConnectedTime = new Date();
     console.log('✅ WhatsApp bridge is connected.');
     sendStatusUpdate('connected').catch(() => {});
-    // NO auto alert – admin will send BAL
   });
 
-  // ========== MESSAGE HANDLER (LID‑safe) ==========
   client.on('message', async msg => {
     if (msg.from === 'status@broadcast' || msg.isStatus || !msg.body) return;
-
     const isGroup = msg.from.endsWith('@g.us');
-    let rawId = isGroup ? (msg.author || msg.from) : msg.from;
+    const rawId = isGroup ? (msg.author || msg.from) : msg.from;
+    const groupId = isGroup ? msg.from : '';
 
-    // 1. Get the contact number (might be a LID string)
-    let contactNumber = null;
+    // Race‑message filter
+    const isRaceMsg = /^\d{1,2}\s*(WIN|PLACE|W|P)\s*\d+$|^(BAL|REG|DEP|WITHDRAW|RESULT|BALSHEET|LINKLID|HIS|HISTORY)/i.test(msg.body);
+    // Always log message
+    fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=logMessage&from=${rawId}&message=${encodeURIComponent(msg.body)}&isGroup=${isGroup}&groupId=${groupId}&isRaceMsg=${isRaceMsg}`).catch(()=>{});
+
+    if (!isRaceMsg) return; // Do not reply to non-race messages
+
+    // Resolve number
+    let fromNumber = null;
     try {
       const contact = await msg.getContact();
-      contactNumber = contact.number;
-    } catch (e) {
-      // ignore
-    }
-
-    let fromNumber = contactNumber;   // could be LID if not in known list
-
-    // 2. If the contact number is not a known phone number, treat it as potential LID
+      fromNumber = contact.number;
+    } catch (e) {}
     if (!fromNumber || !knownNumbers.has(fromNumber)) {
-      const lid = rawId.replace('@c.us', '').replace('@lid', '').replace('@g.us', '');
-      console.log('⚠️ Unknown number, resolving LID:', lid);
+      const lid = rawId.replace('@c.us','').replace('@lid','').replace('@g.us','');
+      console.log('⚠️ Resolving LID:', lid);
       try {
         const resp = await fetch(`${APPS_SCRIPT_URL}?token=${BRIDGE_TOKEN}&action=resolveLid&lid=${lid}`);
         const data = await resp.json();
         if (data.number) {
           fromNumber = data.number;
-          knownNumbers.add(fromNumber);   // remember for future
-          console.log('✅ Resolved LID to phone:', fromNumber);
+          knownNumbers.add(fromNumber);
+          console.log('✅ Resolved to', fromNumber);
         } else {
-          await msg.reply('❌ Your WhatsApp ID is not linked. Contact admin to link your account.');
+          await msg.reply('❌ Your WhatsApp ID is not linked. Contact admin.');
           return;
         }
-      } catch (err) {
-        console.error('Error resolving LID:', err);
-        return;
-      }
+      } catch (err) { console.error('Resolve error:', err); return; }
     }
 
-    // 3. Now fromNumber is a real phone number
     console.log('📩 Message from', fromNumber, ':', msg.body);
-
-    const payload = {
-      token: BRIDGE_TOKEN,
-      from: fromNumber,
-      message: msg.body,
-      isGroup
-    };
-
+    const payload = { token: BRIDGE_TOKEN, from: fromNumber, message: msg.body, isGroup, groupId };
     try {
-      const response = await fetch(APPS_SCRIPT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      const response = await fetch(APPS_SCRIPT_URL, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
       const data = await response.json();
-      console.log('📨 Apps Script reply:', data.reply || '(no reply)');
-      if (data.reply) {
-        await msg.reply(data.reply);
-        console.log('✅ Reply sent.');
-      }
-    } catch (err) {
-      console.error('❌ Error forwarding message:', err);
-    }
+      console.log('📨 Reply:', data.reply || '(no reply)');
+      if (data.reply) { await msg.reply(data.reply); console.log('✅ Reply sent.'); }
+    } catch (err) { console.error('❌ Forward error:', err); }
   });
 
   client.on('disconnected', async (reason) => {
     console.log('🔌 Disconnected:', reason);
     clientStatus = 'disconnected';
     await sendStatusUpdate('disconnected').catch(() => {});
-    setTimeout(() => startClient(), 10000);
+    // Auto-reconnect only if it's not a deliberate logout
+    if (reason !== 'LOGOUT') {
+      setTimeout(() => startClient(), 10000);
+    }
   });
 
   console.log('🚀 Initializing WhatsApp client...');
@@ -242,10 +275,8 @@ async function sendStatusUpdate(status) {
   } catch (e) {}
 }
 
+// ========== Start server (NO auto-start of client) ==========
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  startClient().catch(err => {
-    console.error('Start failed:', err);
-    setTimeout(() => startClient(), 10000);
-  });
+  console.log('👉 Bot not started. Use /start?token=... to begin.');
 });
