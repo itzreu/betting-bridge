@@ -12,13 +12,14 @@ const PORT           = process.env.PORT || 3000;
 const app = express();
 app.use(express.json());
 
-let qrDataUrl        = null;
-let clientStatus     = 'disconnected';
+let qrDataUrl         = null;
+let clientStatus      = 'disconnected';
 let lastConnectedTime = null;
-let qrGenerated      = false;
-let client           = null;
-let knownNumbers     = new Set();
-let lastQrTime       = 0;
+let qrGenerated       = false;
+let client            = null;
+let knownNumbers      = new Set();
+let isStarting        = false;        // 🛡️ Only one start at a time
+let lastDisconnectTime = 0;           // 🛡️ Minimum cooldown between restarts
 
 async function destroyClient() {
   if (client) { try { await client.destroy(); } catch(e) {} client = null; }
@@ -30,14 +31,25 @@ app.get('/health', (_, res) => res.send('OK'));
 app.get('/start', async (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).send('Forbidden');
   if (clientStatus === 'connected') return res.send('<h2>✅ Bot already connected.</h2>');
-  if (Date.now() - lastQrTime < 14400000) {
-    const mins = Math.ceil((14400000 - (Date.now() - lastQrTime)) / 60000);
-    return res.send(`<h2>⏳ QR already generated recently. Wait ${mins} minutes.</h2>`);
+  if (isStarting) return res.send('<h2>⏳ Bot is already starting. Please wait…</h2>');
+
+  const now = Date.now();
+  const cooldown = 120000; // 2 minutes
+  if (now - lastDisconnectTime < cooldown) {
+    const wait = Math.ceil((cooldown - (now - lastDisconnectTime)) / 1000);
+    return res.send(`<h2>⏳ Please wait ${wait} seconds before starting again.</h2>`);
   }
-  lastQrTime = Date.now();
-  await destroyClient();
-  startClient().catch(err => console.error('Start failed:', err));
-  res.send('<h2>🔄 Bot restarting… Open <a href="/qr">QR page</a> to scan.</h2>');
+
+  isStarting = true;
+  lastDisconnectTime = now;    // record the time we started
+
+  try {
+    await startClient();
+    res.send('<h2>🔄 Bot starting… Open <a href="/qr">QR page</a> to scan.</h2>');
+  } catch(e) {
+    isStarting = false;
+    res.send('<h2>❌ Failed to start bot. Try again later.</h2>');
+  }
 });
 
 app.get('/qr', (req, res) => {
@@ -89,6 +101,7 @@ app.post('/logout', async (req, res) => {
   if (req.query.token !== BRIDGE_TOKEN) return res.status(403).json({error:'Forbidden'});
   try {
     if (client) { await client.destroy(); client = null; }
+    isStarting = false;  // allow new starts after logout
     setTimeout(() => startClient().catch(console.error), 3000);
     res.json({result:'Logged out, restarting...'});
   } catch(e) { res.json({error:e.message}); }
@@ -138,7 +151,7 @@ setInterval(() => {
   }
 }, 30000);
 
-// ========== WhatsApp Client ==========
+// ========== WhatsApp Client (ban‑safe) ==========
 async function startClient() {
   const execPath = await chromium.executablePath();
   console.log('Chromium executable:', execPath);
@@ -157,7 +170,21 @@ async function startClient() {
     authStrategy: new LocalAuth({ clientId: 'betting-bot' }),
     puppeteer: {
       executablePath: execPath, headless: 'new',
-      args: [...chromium.args, '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote','--renderer-process-limit=1','--js-flags=--max-old-space-size=128','--memory-pressure-off','--disable-accelerated-2d-canvas','--disable-features=site-per-process,Translate,BackForwardCache','--disable-background-timer-throttling','--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','--metrics-recording-only','--mute-audio','--no-first-run','--safebrowsing-disable-auto-update','--disable-extensions','--disable-default-apps','--disable-sync','--disable-breakpad','--disable-hang-monitor'],
+      args: [
+        ...chromium.args,
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+        '--disable-gpu','--single-process','--no-zygote',
+        '--renderer-process-limit=1','--js-flags=--max-old-space-size=128',
+        '--memory-pressure-off','--disable-accelerated-2d-canvas',
+        '--disable-features=site-per-process,Translate,BackForwardCache',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--metrics-recording-only','--mute-audio','--no-first-run',
+        '--safebrowsing-disable-auto-update','--disable-extensions',
+        '--disable-default-apps','--disable-sync','--disable-breakpad',
+        '--disable-hang-monitor'
+      ],
       protocolTimeout: 240000
     }
   });
@@ -172,11 +199,12 @@ async function startClient() {
   client.on('ready', () => {
     qrGenerated = false; qrDataUrl = null; clientStatus = 'connected';
     lastConnectedTime = new Date();
+    isStarting = false;   // ✅ start sequence complete
     console.log('✅ WhatsApp bridge is connected.');
     sendStatusUpdate('connected').catch(()=>{});
   });
 
-  client.on('message', async msg => {
+client.on('message', async msg => {
     if (msg.from === 'status@broadcast' || msg.isStatus || !msg.body) return;
     const isGroup = msg.from.endsWith('@g.us');
     const rawId = isGroup ? (msg.author || msg.from) : msg.from;
@@ -217,14 +245,25 @@ async function startClient() {
     } catch(e) { console.error('❌ Error:', e); }
   });
 
+  // 🛡️ The ban‑prevention heart – respectful disconnect handling
   client.on('disconnected', async (reason) => {
     console.log('🔌 Disconnected:', reason);
     clientStatus = 'disconnected';
+    isStarting = false;
     await sendStatusUpdate('disconnected').catch(()=>{});
-    if (reason !== 'LOGOUT') setTimeout(() => startClient(), 10000);
+
+    // Determine cooldown: longer if the context was destroyed (navigation)
+    const waitTime = (reason && reason.toString().includes('navigation')) ? 300000 : 120000;  // 5 min or 2 min
+    console.log(`⏳ Will not reconnect for ${waitTime/1000}s to avoid looking like a bot.`);
+    setTimeout(() => {
+      if (!isStarting && clientStatus !== 'connected') {
+        console.log('🔄 Restarting bot after cooldown…');
+        startClient().catch(e => console.error('Restart failed:', e));
+      }
+    }, waitTime);
   });
 
-  console.log('🚀 Initializing...');
+  console.log('🚀 Initializing WhatsApp client...');
   await client.initialize();
 }
 
